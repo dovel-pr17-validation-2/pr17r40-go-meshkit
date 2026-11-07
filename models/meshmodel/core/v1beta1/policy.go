@@ -1,0 +1,74 @@
+package v1beta1
+
+import (
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"github.com/gofrs/uuid"
+	"github.com/meshery/meshkit/database"
+	"github.com/meshery/meshkit/utils"
+	core "github.com/meshery/schemas/models/core"
+	modelv1beta2 "github.com/meshery/schemas/models/v1beta2/model"
+	"gorm.io/gorm/clause"
+
+	"github.com/meshery/meshkit/models/meshmodel/entity"
+)
+
+// swagger:response PolicyDefinition
+type PolicyDefinition struct {
+	ID         core.Uuid               `json:"-"`
+	Kind       string                  `json:"kind,omitempty" yaml:"kind"`
+	Version    string                  `json:"version,omitempty" yaml:"version"`
+	ModelID    core.Uuid               `json:"-" gorm:"column:modelID"`
+	Model      modelv1beta2.ModelDefinition `json:"model"`
+	SubType    string                  `json:"subType" yaml:"subType"`
+	Expression map[string]interface{}  `json:"expression" yaml:"expression" gorm:"type:bytes;serializer:json"`
+	CreatedAt  time.Time               `json:"-"`
+	UpdatedAt  time.Time               `json:"-"`
+}
+
+func (p PolicyDefinition) GetID() core.Uuid {
+	return p.ID
+}
+
+func (p *PolicyDefinition) GenerateID() (core.Uuid, error) {
+	return uuid.NewV4()
+}
+
+func (p PolicyDefinition) Type() entity.EntityType {
+	return entity.PolicyDefinition
+}
+
+func (p *PolicyDefinition) GetEntityDetail() string {
+	return fmt.Sprintf("type: %s, definition version: %s, name: %s, model: %s, version: %s", p.Type(), p.Version, p.Kind, p.Model.Name, p.Model.Version)
+}
+
+func (p *PolicyDefinition) Create(db *database.Handler, hostID core.Uuid) (core.Uuid, error) {
+	var err error
+	p.ID, err = p.GenerateID()
+	if err != nil {
+		return core.Uuid{}, err
+	}
+
+	mid, err := p.Model.Create(db, hostID)
+	if err != nil {
+		return core.Uuid{}, err
+	}
+	p.ModelID = mid
+	err = db.Omit(clause.Associations).Create(&p).Error
+	if err != nil {
+		return core.Uuid{}, err
+	}
+	return p.ID, nil
+}
+
+func (m *PolicyDefinition) UpdateStatus(db *database.Handler, status entity.EntityStatus) error {
+	return nil
+}
+
+func (p PolicyDefinition) WritePolicyDefinition(policyDirPath string) error {
+	policyPath := filepath.Join(policyDirPath, p.Kind+".json")
+	err := utils.WriteJSONToFile[PolicyDefinition](policyPath, p)
+	return err
+}

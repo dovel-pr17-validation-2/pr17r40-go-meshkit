@@ -1,0 +1,87 @@
+package converter
+
+import (
+	"bytes"
+
+	"github.com/meshery/meshkit/models/patterns"
+	"github.com/meshery/meshkit/utils"
+	component "github.com/meshery/schemas/models/v1beta2/component"
+	pattern "github.com/meshery/schemas/models/v1beta3/design"
+	"gopkg.in/yaml.v3"
+)
+
+type K8sConverter struct{}
+
+func (k *K8sConverter) Convert(patternFile string) (string, error) {
+	pattern, err := patterns.GetPatternFormat(patternFile)
+	if err != nil {
+		return "", err
+	}
+
+	patterns.ProcessAnnotations(pattern)
+	patterns.ProcessComponentStatus(pattern)
+	return NewK8sManifestsFromPatternfile(pattern)
+}
+
+func NewK8sManifestsFromPatternfile(patternFile *pattern.PatternFile) (string, error) {
+
+	buf := bytes.NewBufferString("")
+
+	enc := yaml.NewEncoder(buf)
+	enc.SetIndent(2)
+	for _, comp := range patternFile.Components {
+		err := enc.Encode(CreateK8sResourceStructure(comp))
+		if err != nil {
+			return "", err
+		}
+	}
+	return buf.String(), nil
+}
+
+func CreateK8sResourceStructure(comp *component.ComponentDefinition) map[string]interface{} {
+	annotations := map[string]interface{}{}
+	labels := map[string]interface{}{}
+	namespace := "default"
+
+	_confMetadata, ok := comp.Configuration["metadata"]
+	if ok {
+		confMetadata, err := utils.Cast[map[string]interface{}](_confMetadata)
+		if err == nil {
+
+			_annotations, ok := confMetadata["annotations"]
+			if ok {
+				annotations, _ = utils.Cast[map[string]interface{}](_annotations)
+			}
+
+			_label, ok := confMetadata["labels"]
+			if ok {
+				labels, _ = utils.Cast[map[string]interface{}](_label)
+			}
+
+			_ns, ok := confMetadata["namespace"]
+			if ok {
+				namespace, _ = utils.Cast[string](_ns)
+			}
+		}
+	}
+
+	component := map[string]interface{}{
+		"apiVersion": comp.Component.Version,
+		"kind":       comp.Component.Kind,
+		"metadata": map[string]interface{}{
+			"name":        comp.DisplayName,
+			"annotations": annotations,
+			"labels":      labels,
+			"namespace":   namespace,
+		},
+	}
+
+	for k, v := range comp.Configuration {
+		if k == "apiVersion" || k == "kind" || k == "metadata" || k == "namespace" {
+			continue
+		}
+
+		component[k] = v
+	}
+	return component
+}

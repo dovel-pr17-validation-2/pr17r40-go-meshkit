@@ -1,0 +1,134 @@
+package error
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/meshery/meshkit/cmd/errorutil/internal/component"
+	"github.com/meshery/meshkit/cmd/errorutil/internal/config"
+	"github.com/meshery/schemas/models/v1beta3/errorcode"
+	log "github.com/sirupsen/logrus"
+)
+
+// Error is used to export Error for e.g. documentation purposes.
+//
+// Type Error (errors/types.go) is not reused in order to avoid tight coupling between code and documentation of errors, e.g. on Meshery website.
+// It is good practice not to use internal data types in integrations; one should in general transform between internal and external models.
+// DDD calls this anti-corruption layer.
+// One reason is that one might like to have a different representation externally, e.g. severity 'info' instead of '1'.
+// Another one is that it is often desirable to be able to change the internal representation without the need for the consumer
+// (in this case, the meshery doc) to have to adjust quickly in order to be able to handle updated content.
+// The lifecycles of producers and consumers should not be tightly coupled.
+type Error struct {
+	Name                 string `yaml:"name" json:"name"`                                   // the name of the error code variable, e.g. "ErrInstallMesh", not guaranteed to be unique as it is package scoped
+	Code                 string `yaml:"code" json:"code"`                                   // the code, an int, but exported as string, e.g. "1001", guaranteed to be unique per component-type:component-name
+	Severity             string `yaml:"severity" json:"severity"`                           // a textual representation of the type Severity (errors/types.go), i.e. "none", "alert", etc
+	LongDescription      string `yaml:"long_description" json:"long_description"`           // might contain newlines (JSON encoded)
+	ShortDescription     string `yaml:"short_description" json:"short_description"`         // might contain newlines (JSON encoded)
+	ProbableCause        string `yaml:"probable_cause" json:"probable_cause"`               // might contain newlines (JSON encoded)
+	SuggestedRemediation string `yaml:"suggested_remediation" json:"suggested_remediation"` // might contain newlines (JSON encoded)
+	// ProbableCauses is the nested form of an errors.NewV3 definition: each cause with the remediations that
+	// answer it, in the schemas error construct's ProbableCause shape (meshery/schemas#1334). Omitted for New and
+	// NewV2 definitions, so the export's legacy shape is unchanged. A NewV3 definition errorutil rejected is not
+	// exported at all.
+	ProbableCauses []errorcode.ProbableCause `yaml:"probableCauses,omitempty" json:"probableCauses,omitempty"`
+
+	// The fields below are analysis data, kept in errorutil_analyze_errors.json and never exported.
+
+	// Constructor is the MeshKit constructor of the definition: New, NewV2 or NewV3.
+	Constructor string `yaml:"constructor,omitempty" json:"constructor,omitempty"`
+	// Problems lists why errorutil rejects a NewV3 definition. Each is reported as an error, and a definition with
+	// problems is left out of both exports.
+	Problems []string `yaml:"problems,omitempty" json:"problems,omitempty"`
+	// Lines holds the literal lines of each description list, before they are joined with newlines above.
+	Lines Lines `yaml:"-" json:"-"`
+}
+
+// Lines holds the literal lines of an error definition's string lists.
+type Lines struct {
+	ShortDescription     []string
+	LongDescription      []string
+	ProbableCause        []string
+	SuggestedRemediation []string
+}
+
+// externalAll is used to export all Errors including information about the component for e.g. documentation purposes.
+type externalAll struct {
+	ComponentName string           `yaml:"component_name" json:"component_name"` // component type, e.g. "adapter"
+	ComponentType string           `yaml:"component_type" json:"component_type"` // component name, e.g. "kuma"
+	Errors        map[string]Error `yaml:"errors" json:"errors"`                 // map of all errors with key = code
+}
+
+func Export(componentInfo *component.Info, infoAll *InfoAll, outputDir string) error {
+	fname := filepath.Join(outputDir, config.App+"_errors_export.json")
+	export := externalAll{
+		ComponentType: componentInfo.Type,
+		ComponentName: componentInfo.Name,
+		Errors:        make(map[string]Error),
+	}
+	for k, v := range infoAll.LiteralCodes {
+		if len(v) > 1 {
+			log.Errorf("duplicate code '%s' - skipping export", k)
+			continue
+		}
+
+		errorInfo := v[0]
+		errorCode := strings.TrimPrefix(errorInfo.Code, fmt.Sprintf("%s-", componentInfo.Name))
+		if _, err := strconv.Atoi(errorCode); err != nil {
+			log.Errorf("non-integer code '%s' - skipping export", k)
+			continue
+		}
+		// default value used if validations below fail
+		export.Errors[k] = Error{
+			Name:                 errorInfo.Name,
+			Code:                 errorInfo.Code,
+			Severity:             "",
+			ShortDescription:     "",
+			LongDescription:      "",
+			ProbableCause:        "",
+			SuggestedRemediation: "",
+		}
+		// were details for this error generated using errors.New(...)?
+		if _, ok := infoAll.Errors[errorInfo.Name]; ok {
+			log.Infof("error details found for error name '%s' and code '%s'", errorInfo.Name, errorInfo.Code)
+			// no duplicates?
+			if len(infoAll.Errors[errorInfo.Name]) == 1 {
+				details := infoAll.Errors[errorInfo.Name][0]
+				if len(details.Problems) > 0 {
+					// A rejected NewV3 definition is never exported in a reduced form: its causes and text would be
+					// incomplete. It is listed in the summary's invalid_definitions and fails analyze and update.
+					log.Errorf("invalid %s definition for error name '%s' and code '%s' - skipping export", details.Constructor, errorInfo.Name, errorInfo.Code)
+					delete(export.Errors, k)
+					continue
+				}
+				export.Errors[k] = Error{
+					Name:                 details.Name,
+					Code:                 errorInfo.Code,
+					Severity:             details.Severity,
+					ShortDescription:     details.ShortDescription,
+					LongDescription:      details.LongDescription,
+					ProbableCause:        details.ProbableCause,
+					SuggestedRemediation: details.SuggestedRemediation,
+					ProbableCauses:       details.ProbableCauses,
+				}
+			} else {
+				log.Errorf("duplicate error details for error name '%s' and code '%s'", errorInfo.Name, errorInfo.Code)
+			}
+		} else {
+			log.Warnf("no error details found for error name '%s' and code '%s'", errorInfo.Name, errorInfo.Code)
+		}
+	}
+	jsn, err := json.MarshalIndent(export, "", "  ")
+	if err != nil {
+		return err
+	}
+	log.Infof("exporting to %s", fname)
+	if err := os.WriteFile(fname, jsn, 0600); err != nil {
+		return err
+	}
+	return ExportIndex(componentInfo, export.Errors, infoAll, outputDir)
+}

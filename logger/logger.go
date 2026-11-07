@@ -1,0 +1,210 @@
+package logger
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"time"
+
+	"github.com/go-logr/logr"
+	"github.com/meshery/meshkit/errors"
+	"github.com/sirupsen/logrus"
+	gormlogger "gorm.io/gorm/logger"
+)
+
+type Handler interface {
+	Info(description ...interface{})
+	Infof(format string, args ...interface{})
+	Debug(description ...interface{})
+	Debugf(format string, args ...interface{})
+	Warn(err error)
+	Warnf(format string, args ...interface{})
+	Error(err error)
+	Errorf(format string, args ...interface{})
+	Fatal(err error)
+	Fatalf(format string, args ...interface{})
+	SetLevel(level logrus.Level)
+	GetLevel() logrus.Level
+	UpdateLogOutput(w io.Writer)
+	UpdateErrorLogOutput(w io.Writer)
+	// Kubernetes Controller compliant logger
+	ControllerLogger() logr.Logger
+	DatabaseLogger() gormlogger.Interface
+}
+
+type Logger struct {
+	defaultHandler *logrus.Entry
+	errorHandler   *logrus.Entry
+}
+
+// TerminalFormatter is exported
+type TerminalFormatter struct{}
+
+// Format defined the format of output for Logrus logs
+// Format is exported
+func (f *TerminalFormatter) Format(entry *logrus.Entry) ([]byte, error) {
+	if entry == nil {
+		return []byte{}, nil
+	}
+
+	msg := entry.Message
+	if caller, exists := entry.Data["caller"]; exists {
+		if callerStr, ok := caller.(string); ok {
+			msg = fmt.Sprintf("[%s] %s", callerStr, entry.Message)
+		}
+	}
+	return append([]byte(msg), '\n'), nil
+}
+
+func newLogrusLogger(appname string, opts Options, defaultOutput io.Writer) *logrus.Entry {
+	log := logrus.New()
+
+	switch opts.Format {
+	case JsonLogFormat:
+		log.SetFormatter(&logrus.JSONFormatter{
+			TimestampFormat: time.RFC3339,
+		})
+	case SyslogLogFormat:
+		log.SetFormatter(&logrus.TextFormatter{
+			TimestampFormat: time.RFC3339,
+			FullTimestamp:   true,
+		})
+	case TerminalLogFormat:
+		log.SetFormatter(new(TerminalFormatter))
+	}
+
+	// Add caller hook if enabled
+	if opts.EnableCallerInfo {
+		// Use provided skipped paths or default ones
+		skippedPaths := opts.CallerSkippedPaths
+		if skippedPaths == nil {
+			skippedPaths = defaultCallerSkippedPaths
+		}
+		log.AddHook(&CallerHook{skippedPaths: skippedPaths})
+	}
+
+	log.SetOutput(defaultOutput)
+	if opts.Output != nil {
+		log.SetOutput(opts.Output)
+	}
+
+	if opts.ErrorOutput != nil {
+		log.SetOutput(opts.ErrorOutput)
+	}
+
+	log.SetLevel(logrus.Level(opts.LogLevel))
+
+	return log.WithFields(logrus.Fields{"app": appname})
+}
+
+func New(appname string, opts Options) (Handler, error) {
+	entry := newLogrusLogger(appname, opts, os.Stdout)
+	errEntry := newLogrusLogger(appname, opts, os.Stderr)
+	return &Logger{defaultHandler: entry, errorHandler: errEntry}, nil
+}
+
+func (l *Logger) Info(description ...interface{}) {
+	l.defaultHandler.Log(logrus.InfoLevel,
+		description...,
+	)
+}
+
+func (l *Logger) Infof(format string, args ...interface{}) {
+	l.defaultHandler.Log(logrus.InfoLevel, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Debug(description ...interface{}) {
+	l.defaultHandler.Log(logrus.DebugLevel,
+		description...,
+	)
+}
+
+func (l *Logger) Debugf(format string, args ...interface{}) {
+	l.defaultHandler.Log(logrus.DebugLevel, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Warn(err error) {
+	if err == nil {
+		return
+	}
+
+	l.defaultHandler.WithFields(errorFields(err)).Log(logrus.WarnLevel, err.Error())
+}
+
+func (l *Logger) Warnf(format string, args ...interface{}) {
+	l.defaultHandler.Log(logrus.WarnLevel, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Error(err error) {
+	if err == nil {
+		return
+	}
+
+	l.errorHandler.WithFields(errorFields(err)).Log(logrus.ErrorLevel, err.Error())
+}
+
+func (l *Logger) Errorf(format string, args ...interface{}) {
+	l.errorHandler.Log(logrus.ErrorLevel, fmt.Sprintf(format, args...))
+}
+
+func (l *Logger) Fatal(err error) {
+	if err == nil {
+		return
+	}
+
+	l.errorHandler.WithFields(errorFields(err)).Log(logrus.FatalLevel, err.Error())
+	os.Exit(1)
+}
+
+func (l *Logger) Fatalf(format string, args ...interface{}) {
+	l.errorHandler.Log(logrus.FatalLevel, fmt.Sprintf(format, args...))
+	os.Exit(1)
+}
+
+func (l *Logger) SetLevel(level logrus.Level) {
+	l.defaultHandler.Logger.SetLevel(level)
+	l.errorHandler.Logger.SetLevel(level)
+}
+
+func (l *Logger) GetLevel() logrus.Level {
+	return l.defaultHandler.Logger.GetLevel()
+}
+
+func (l *Logger) UpdateLogOutput(output io.Writer) {
+	l.defaultHandler.Logger.SetOutput(output)
+}
+
+func (l *Logger) UpdateErrorLogOutput(output io.Writer) {
+	l.errorHandler.Logger.SetOutput(output)
+}
+
+// errorFields is the structured form of a MeshKit error in a log entry: the
+// flat fields every MeshKit error carries and, for an error created with
+// errors.NewV3, "probable-causes" with each cause nested with its remediations
+// in the schemas error construct's JSON shape.
+func errorFields(err error) logrus.Fields {
+	fields := logrus.Fields{
+		"code":                  errors.GetCode(err),
+		"severity":              errors.GetSeverity(err),
+		"short-description":     errors.GetSDescription(err),
+		"probable-cause":        errors.GetCause(err),
+		"suggested-remediation": errors.GetRemedy(err),
+	}
+	if causes := errors.GetCauses(err); len(causes) > 0 {
+		fields["probable-causes"] = causesField(causes)
+	}
+	return fields
+}
+
+// causesField marshals as nested JSON under the JSON formatter and prints as
+// compact JSON under the text formatter, instead of Go's struct syntax.
+type causesField []errors.Cause
+
+func (c causesField) String() string {
+	raw, err := json.Marshal([]errors.Cause(c))
+	if err != nil {
+		return fmt.Sprintf("%v", []errors.Cause(c))
+	}
+	return string(raw)
+}

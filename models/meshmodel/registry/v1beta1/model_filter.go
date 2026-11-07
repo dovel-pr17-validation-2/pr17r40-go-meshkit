@@ -1,0 +1,224 @@
+package v1beta1
+
+import (
+	"github.com/meshery/meshkit/database"
+	"github.com/meshery/meshkit/models/meshmodel/entity"
+	"github.com/meshery/meshkit/models/meshmodel/registry"
+	"github.com/meshery/schemas/models/v1alpha3/relationship"
+	"github.com/meshery/schemas/models/v1beta1/model"
+	"github.com/meshery/schemas/models/v1beta3/component"
+
+	"gorm.io/gorm/clause"
+)
+
+type ModelFilter struct {
+	Id          string
+	Name        string
+	Registrant  string //name of the registrant for a given model
+	DisplayName string //If Name is already passed, avoid passing Display name unless greedy=true, else the filter will translate to an AND returning only the models where name and display name match exactly. Ignore, if this behavior is expected.
+	Greedy      bool   //when set to true - instead of an exact match, name will be prefix matched. Also an OR will be performed of name and display_name
+	Version     string
+	Category    string
+	OrderOn     string
+	Sort        string //asc or desc. Default behavior is asc
+	Limit       int    //If 0 or unspecified then all records are returned and limit is not used
+	Offset      int
+	Annotations string //When this query parameter is "true", only models with the "isAnnotation" property set to true are returned. When  this query parameter is "false", all models except those considered to be annotation models are returned. Any other value of the query parameter results in both annoations as well as non-annotation models being returned.
+
+	// When these are set to true, we also retrieve components/relationships associated with the model.
+	Components    bool
+	Relationships bool
+	Status        string
+	// When Trim is true it will only send necessary models data
+	// like: component count, relationship count, id and name of model
+	Trim bool
+}
+
+// Create the filter from map[string]interface{}
+func (mf *ModelFilter) Create(m map[string]interface{}) {
+	if m == nil {
+		return
+	}
+	mf.Name = m["name"].(string)
+}
+
+func countUniqueModels(models []model.ModelDefinition) int {
+	set := make(map[string]struct{})
+	for _, model := range models {
+		key := model.Name + "@" + model.Model.Version
+		if _, ok := set[key]; !ok {
+			set[key] = struct{}{}
+		}
+	}
+	return len(set)
+}
+func (mf *ModelFilter) GetById(db *database.Handler) (entity.Entity, error) {
+	m := &model.ModelDefinition{}
+
+	// Retrieve the model by ID
+	err := db.First(m, "id = ?", mf.Id).Error
+	if err != nil {
+		return nil, registry.ErrGetById(err, mf.Id)
+	}
+
+	// Include components if requested
+	if mf.Components {
+		var components []component.ComponentDefinition
+		componentFinder := db.Model(&component.ComponentDefinition{}).
+			Select("component_definition_dbs.id, component_definition_dbs.component, component_definition_dbs.display_name, component_definition_dbs.metadata, component_definition_dbs.schema_version, component_definition_dbs.version").
+			Where("component_definition_dbs.model_id = ?", m.ID)
+		if err := componentFinder.Scan(&components).Error; err != nil {
+			return nil, err
+		}
+		m.Components = components
+	}
+
+	// Include relationships if requested
+	if mf.Relationships {
+		var relationships []relationship.RelationshipDefinition
+		relationshipFinder := db.Model(&relationship.RelationshipDefinition{}).
+			Select("relationship_definition_dbs.*").
+			Where("relationship_definition_dbs.model_id = ?", m.ID)
+		if err := relationshipFinder.Scan(&relationships).Error; err != nil {
+			return nil, err
+		}
+		m.Relationships = relationships
+	}
+
+	return m, nil
+}
+
+func (mf *ModelFilter) Get(db *database.Handler) ([]entity.Entity, int64, int, error) {
+
+	var modelWithCategories []model.ModelDefinition
+
+	finder := db.Model(&model.ModelDefinition{}).Preload("Category").Preload("Registrant").
+		Joins("JOIN category_dbs ON model_dbs.category_id = category_dbs.id").
+		Joins("JOIN registries ON registries.entity = model_dbs.id").
+		Joins("JOIN connections ON connections.id = registries.registrant_id")
+
+	// total count before pagination
+	var count int64
+
+	// include components and relationships in response body
+	var includeComponents, includeRelationships bool
+
+	if mf.Greedy {
+		if mf.Id != "" {
+			finder = finder.Where("model_dbs.id = ?", mf.Id)
+		}
+		if mf.Name != "" && mf.DisplayName != "" {
+			finder = finder.Where("model_dbs.name LIKE ? OR model_dbs.display_name LIKE ?", "%"+mf.Name+"%", "%"+mf.DisplayName+"%")
+		} else if mf.Name != "" {
+			finder = finder.Where("model_dbs.name LIKE ?", "%"+mf.Name+"%")
+		} else if mf.DisplayName != "" {
+			finder = finder.Where("model_dbs.display_name LIKE ?", "%"+mf.DisplayName+"%")
+		}
+	} else {
+		if mf.Name != "" {
+			finder = finder.Where("model_dbs.name = ?", mf.Name)
+		}
+		if mf.DisplayName != "" {
+			finder = finder.Where("model_dbs.display_name = ?", mf.DisplayName)
+		}
+	}
+	switch mf.Annotations {
+	case "true":
+		finder = finder.Where("model_dbs.metadata->>'isAnnotation' = true")
+	case "false":
+		finder = finder.Where("model_dbs.metadata->>'isAnnotation' = false")
+	}
+	if mf.Version != "" {
+		finder = finder.Where("model_dbs.model->>'version' = ?", mf.Version)
+	}
+	if mf.Category != "" {
+		finder = finder.Where("category_dbs.name = ?", mf.Category)
+	}
+	if mf.Registrant != "" {
+		finder = finder.Where("connections.kind = ?", mf.Registrant)
+	}
+	if mf.Id != "" {
+		finder = finder.Where("model_dbs.id = ?", mf.Id)
+	}
+	if mf.OrderOn != "" {
+		if mf.Sort == "desc" {
+			finder = finder.Order(clause.OrderByColumn{Column: clause.Column{Name: mf.OrderOn}, Desc: true})
+		} else {
+			finder = finder.Order(mf.OrderOn)
+		}
+	} else {
+		finder = finder.Order("display_name")
+	}
+
+	if mf.Status != "" {
+		finder = finder.Where("model_dbs.status = ?", mf.Status)
+	}
+
+	finder.Count(&count)
+
+	if mf.Limit != 0 {
+		finder = finder.Limit(mf.Limit)
+	}
+	if mf.Offset != 0 {
+		finder = finder.Offset(mf.Offset)
+	}
+
+	includeComponents = mf.Components
+	includeRelationships = mf.Relationships
+
+	err := finder.
+		Find(&modelWithCategories).Error
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	defs := []entity.Entity{}
+
+	for _, modelDB := range modelWithCategories {
+		// resolve for loop scope
+		_modelDB := modelDB
+		var componentCount int64
+		db.Model(&component.ComponentDefinition{}).Where("component_definition_dbs.model_id = ?", _modelDB.ID).Count(&componentCount)
+		var relationshipCount int64
+		db.Model(&relationship.RelationshipDefinition{}).Where("relationship_definition_dbs.model_id = ?", _modelDB.ID).Count(&relationshipCount)
+		_modelDB.ComponentsCount = int(componentCount)
+		_modelDB.RelationshipsCount = int(relationshipCount)
+
+		// If Trim is true, only include the id, name, counts and metadata
+		if mf.Trim {
+			trimmedModel := &model.ModelDefinition{
+				ID:                 _modelDB.ID,
+				Name:               _modelDB.Name,
+				DisplayName:        _modelDB.DisplayName,
+				Metadata:           _modelDB.Metadata,
+				ComponentsCount:    int(componentCount),
+				RelationshipsCount: int(relationshipCount),
+			}
+			defs = append(defs, trimmedModel)
+
+		} else {
+			if includeComponents {
+				var components []component.ComponentDefinition
+				finder := db.Model(&component.ComponentDefinition{}).
+					Select("component_definition_dbs.*").
+					Where("component_definition_dbs.model_id = ?", _modelDB.ID)
+				if err := finder.Scan(&components).Error; err != nil {
+					return nil, 0, 0, err
+				}
+				_modelDB.Components = components
+			}
+			if includeRelationships {
+				var relationships []relationship.RelationshipDefinition
+				finder := db.Model(&relationship.RelationshipDefinition{}).
+					Select("relationship_definition_dbs.*").
+					Where("relationship_definition_dbs.model_id = ?", _modelDB.ID)
+				if err := finder.Scan(&relationships).Error; err != nil {
+					return nil, 0, 0, err
+				}
+				_modelDB.Relationships = relationships
+			}
+			defs = append(defs, &_modelDB)
+		}
+	}
+	return defs, count, countUniqueModels(modelWithCategories), nil
+}

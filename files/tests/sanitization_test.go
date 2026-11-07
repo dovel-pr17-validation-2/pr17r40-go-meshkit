@@ -1,0 +1,321 @@
+package files_test
+
+import (
+	"archive/tar"
+	"bytes"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"archive/zip"
+	"github.com/meshery/meshkit/errors"
+	"github.com/meshery/meshkit/files"
+	"github.com/meshery/schemas/models/core"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestSanitizeFile(t *testing.T) {
+	testCases := []struct {
+		name            string
+		filePath        string
+		expectedExt     string
+		expectError     bool
+		expectedErrCode string
+		expectedContent map[string]interface{}
+		expectedType    core.IaCFileTypes
+	}{
+		{
+			name:         "Valid JSON",
+			filePath:     "./samples/valid.json",
+			expectedExt:  ".json",
+			expectedType: "",
+		},
+		{
+			name:        "Invalid JSON",
+			filePath:    "./samples/invalid.json",
+			expectError: true,
+		},
+		{
+			name:        "Valid YAML",
+			filePath:    "./samples/valid.yml",
+			expectedExt: ".yml",
+		},
+		{
+			name:         "Invalid YAML",
+			filePath:     "./samples/invalid.yml",
+			expectError:  true,
+			expectedType: "",
+		},
+		{
+			name:            "Unsupported extension",
+			filePath:        "./samples/valid.txt",
+			expectError:     true,
+			expectedErrCode: files.ErrUnsupportedExtensionCode,
+		},
+		{
+			name:        "Valid compressed extension",
+			filePath:    "./samples/valid.tar.gz",
+			expectedExt: ".gz",
+		},
+		{
+			name:        "Valid Nested Tar",
+			filePath:    "./samples/nested.tar.gz",
+			expectedExt: ".gz",
+		},
+		{
+			name:        "Empty file",
+			filePath:    "./samples/empty.json",
+			expectError: true,
+		},
+		{
+			name:        "invalid tar.gz",
+			filePath:    "./samples/invalid.tar.gz",
+			expectError: true,
+		},
+
+		{
+			name:         "Can Identify Design",
+			filePath:     "./samples/valid_design.yml",
+			expectedExt:  ".yml",
+			expectedType: core.MesheryDesign,
+		},
+
+		{
+			name:         "Can Identify Designs packaged as OCI images",
+			filePath:     "./samples/valid-design-oci.tar",
+			expectedExt:  ".tar",
+			expectedType: core.MesheryDesign,
+		},
+		{
+			name:         "Can Identify Kubernetes Manifest",
+			filePath:     "./samples/valid_manifest.yml",
+			expectedExt:  ".yml",
+			expectedType: core.K8sManifest,
+		},
+
+		{
+			name:         "Can Identify Kubernetes Manifest With Crds",
+			filePath:     "./samples/manifest-with-crds.yml",
+			expectedExt:  ".yml",
+			expectedType: core.K8sManifest,
+		},
+
+		{
+			name:         "Can Identify HelmChart",
+			filePath:     "./samples/valid-helm.tgz",
+			expectedExt:  ".tgz",
+			expectedType: core.HelmChart,
+		},
+		{
+			name:         "Can Identify Kustomize archive (tar.gz)",
+			filePath:     "./samples/wordpress-kustomize.tar.gz",
+			expectedExt:  ".gz",
+			expectedType: core.K8sKustomize,
+		},
+		{
+			name:         "Can Identify Kustomize archive (zip)",
+			filePath:     "./samples/wordpress-kustomize.zip",
+			expectedExt:  ".zip",
+			expectedType: core.K8sKustomize,
+		},
+		{
+			name:         "Can Identify Docker Compose",
+			filePath:     "./samples/valid-docker-compose.yml",
+			expectedExt:  ".yml",
+			expectedType: core.DockerCompose,
+		},
+
+		{
+			name:         "Can Identify Docker Compose v2",
+			filePath:     "./samples/valid-compose-2.yml",
+			expectedExt:  ".yml",
+			expectedType: core.DockerCompose,
+		},
+
+		// {
+		// 	name:         "Can Identify Docker Compose without version",
+		// 	filePath:     "./samples/valid-compose-3.yml",
+		// 	expectedExt:  ".yml",
+		// 	expectedType: files.DOCKER_COMPOSE,
+		// },
+	}
+
+	validExts := map[string]bool{
+		".json":   true,
+		".yml":    true,
+		".yaml":   true,
+		".tar":    true,
+		".tar.gz": true,
+		".tgz":    true,
+		".zip":    true,
+	}
+
+	tempDir, _ := os.MkdirTemp(" ", "temp-tests")
+	defer func() { _ = os.RemoveAll(tempDir) }()
+	// tempDir := "./temp"
+
+	for _, tc := range testCases {
+
+		filename := filepath.Base(tc.filePath)
+		// Read file bytes
+		data, err := os.ReadFile(tc.filePath)
+		if err != nil {
+			t.Error("Error reading file:", err)
+			continue
+		}
+
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := files.SanitizeFile(data, filename, tempDir, validExts)
+
+			if tc.expectError {
+				if err == nil {
+					t.Error("Expected error, got nil")
+				} else if tc.expectedErrCode != "" && errors.GetCode(err) != tc.expectedErrCode {
+					t.Errorf("Expected error message %q, got %q", tc.expectedErrCode, err.Error())
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if result.FileExt != tc.expectedExt {
+				t.Errorf("Expected file extension %q, got %q", tc.expectedExt, result.FileExt)
+			}
+
+			if tc.expectedType != "" {
+				identified_file, err := files.IdentifyFile(result)
+
+				if (err != nil || identified_file.Type != tc.expectedType) && !tc.expectError {
+					t.Errorf("Failed To Identify File as %s , got %s, errors %s", tc.expectedType, identified_file.Type, err)
+				}
+
+			}
+
+		})
+	}
+}
+
+// Test that providing an uncompressed .tar containing a Helm chart yields the
+// helpful ErrUncompressedTar (which uses ErrInvalidHelmChartCode).
+func TestUncompressedHelmTarError(t *testing.T) {
+	// Build an in-memory uncompressed tar with a Chart.yaml
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	chartYAML := []byte("apiVersion: v2\nname: test-chart\nversion: 0.1.0\n")
+	hdr := &tar.Header{
+		Name: "Chart.yaml",
+		Mode: 0600,
+		Size: int64(len(chartYAML)),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("failed to write tar header: %v", err)
+	}
+	if _, err := tw.Write(chartYAML); err != nil {
+		t.Fatalf("failed to write chart content: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+
+	tempDir, err := os.MkdirTemp("", "temp-tests")
+	if err != nil {
+		t.Fatalf("failed to create temp directory: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	validExts := map[string]bool{
+		".json": true,
+		".yml":  true,
+		".yaml": true,
+		".tar":  true,
+		".tgz":  true,
+		".gz":   true,
+		".zip":  true,
+	}
+
+	sanitized, err := files.SanitizeFile(buf.Bytes(), "uncompressed-helm.tar", tempDir, validExts)
+	if err != nil {
+		t.Fatalf("unexpected sanitize error: %v", err)
+	}
+
+	_, err = files.ParseFileAsHelmChart(sanitized)
+	assert.NotNil(t, err)
+	assert.Equal(t, files.ErrUncompressedTarCode, errors.GetCode(err))
+}
+
+func TestZipSlipVulnerability(t *testing.T) {
+	// Helper to create a temporary directory for extraction
+	tempDir, err := os.MkdirTemp("", "zip-slip-tests")
+	if err != nil {
+		t.Fatalf("failed to create temp directory: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tempDir) }()
+
+	validExts := map[string]bool{
+		".tar": true,
+		".zip": true,
+	}
+
+	t.Run("Malicious Tar Archive (Tar Slip)", func(t *testing.T) {
+		// 1. Create a malicious tar archive in memory
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+
+		// Create a header with a path traversal filename
+		header := &tar.Header{
+			Name: "../../evil_file.txt",
+			Mode: 0600,
+			Size: int64(len("malicious content")),
+		}
+
+		if err := tw.WriteHeader(header); err != nil {
+			t.Fatalf("failed to write tar header: %v", err)
+		}
+		if _, err := tw.Write([]byte("malicious content")); err != nil {
+			t.Fatalf("failed to write tar body: %v", err)
+		}
+		if err := tw.Close(); err != nil {
+			t.Fatalf("failed to close tar writer: %v", err)
+		}
+
+		// 2. Attempt to sanitize/extract it
+		_, err := files.SanitizeFile(buf.Bytes(), "attack.tar", tempDir, validExts)
+
+		// 3. Assert that it failed with the expected security error
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "zip slip attempt")
+	})
+
+	t.Run("Malicious Zip Archive (Zip Slip)", func(t *testing.T) {
+		// 1. Create a malicious zip archive in memory
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+
+		// Create a file header with a path traversal filename
+		// Note: zip.Writer.Create usually cleans paths, so we use CreateHeader to force the name
+		header := &zip.FileHeader{
+			Name:   "../../evil_file.txt",
+			Method: zip.Store,
+		}
+
+		writer, err := zw.CreateHeader(header)
+		if err != nil {
+			t.Fatalf("failed to create zip entry: %v", err)
+		}
+		if _, err := writer.Write([]byte("malicious content")); err != nil {
+			t.Fatalf("failed to write zip body: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("failed to close zip writer: %v", err)
+		}
+
+		// 2. Attempt to sanitize/extract it
+		_, err = files.SanitizeFile(buf.Bytes(), "attack.zip", tempDir, validExts)
+
+		// 3. Assert that it failed with the expected security error
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "zip slip attempt")
+	})
+}

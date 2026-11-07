@@ -1,0 +1,69 @@
+name: Meshkit Error Codes Utility Runner
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "master"
+    paths:
+      - "**.go"
+
+jobs:
+  Update-error-codes:
+    name: Error codes utility
+    if: github.repository == 'meshery/meshkit'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        # token here with write access to meshkit repo
+        with:
+          token: ${{ secrets.GH_ACCESS_TOKEN }}
+          ref: "master"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Run utility
+        run: |
+          go run github.com/meshery/meshkit/cmd/errorutil -d . update --skip-dirs meshery -i ./helpers -o ./helpers
+
+      - name: Pull changes from remote
+        run: git pull origin master
+
+      # to update errorutil* files in meshkit repo
+      - name: Commit changes
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_user_name: meshery-ci
+          commit_user_email: ci@meshery.io
+          commit_author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
+          commit_options: "--signoff"
+          commit_message: "run error codes utility"
+          file_pattern: helpers/ **.go
+
+      # to push changes to meshery docs
+      - name: Checkout meshery
+        uses: actions/checkout@v6
+        with:
+          repository: "meshery/meshery"
+          # token with write access to meshery repository
+          token: ${{ secrets.MESHERY_CI }}
+          path: "meshery"
+          ref: "master"
+
+      - name: Update and push docs
+        run: |
+          echo '{ "errors_export": "" }' | jq --slurpfile export ./helpers/errorutil_errors_export.json '.errors_export = $export[0]' > ./meshery/docs/data/errorref/meshkit_errors_export.json
+
+          cd ./meshery
+          git config user.name l5io
+          git config user.email ci@meshery.io
+          if git diff --exit-code --quiet
+          then
+            echo "No changes to commit"
+            exit
+          fi
+          git add ./docs/data/errorref/meshkit_errors_export.json
+          git commit -m "[Docs] Error Code Reference: Updated codes for MeshKit library" --signoff
+          git push origin master

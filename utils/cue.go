@@ -1,0 +1,143 @@
+package utils
+
+import (
+	"fmt"
+	"io"
+
+	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+	"cuelang.org/go/cue/errors"
+	"cuelang.org/go/cue/format"
+	"cuelang.org/go/encoding/json"
+	"cuelang.org/go/encoding/jsonschema"
+	"cuelang.org/go/encoding/yaml"
+)
+
+var (
+	formatCueNode = format.Node
+	compileCue    = func(ctx *cue.Context, src string) cue.Value {
+		return ctx.CompileString(src)
+	}
+	lookupCuePath = func(root cue.Value, path string) (cue.Value, error, bool) {
+		res := root.LookupPath(cue.ParsePath(path))
+		return res, res.Err(), res.Exists()
+	}
+)
+
+func Validate(schema cue.Value, value cue.Value) (bool, []errors.Error) {
+	var errs []errors.Error
+	uval := value.Unify(schema)
+	err := uval.Validate(cue.Final())
+	if err != nil {
+		cueErr := errors.Errors(err)
+		errs = append(errs, cueErr...)
+	}
+
+	schema.Walk(func(v cue.Value) bool {
+		val := value.LookupPath(v.Path())
+		if val.Err() != nil || !val.IsConcrete() {
+			cueErr := errors.Errors(errors.New(fmt.Sprintf("%v is a required field", v.Path().String())))
+			errs = append(errs, cueErr...)
+		}
+		return true
+	}, nil)
+
+	if len(errs) != 0 {
+		return false, errs
+	}
+	return true, make([]errors.Error, 0)
+}
+
+func GetNonConcreteFields(val cue.Value) []string {
+	res := make([]string, 0)
+	val.Walk(func(v cue.Value) bool {
+		if !v.IsConcrete() {
+			res = append(res, v.Path().String())
+		}
+		return true
+	}, nil)
+	return res
+}
+
+func JsonToCue(value []byte) (cue.Value, error) {
+	var out cue.Value
+	cuectx := cuecontext.New()
+	expr, err := json.Extract("", value)
+	if err != nil {
+		return out, ErrJsonToCue(err)
+	}
+	out = cuectx.BuildExpr(expr)
+	if out.Err() != nil {
+		return out, ErrJsonToCue(out.Err())
+	}
+	return out, nil
+}
+
+func YamlToCue(value string) (cue.Value, error) {
+	var out cue.Value
+	cuectx := cuecontext.New()
+	expr, err := yaml.Extract("", value)
+	if err != nil {
+		return out, ErrYamlToCue(err)
+	}
+	out = cuectx.BuildFile(expr)
+	if out.Err() != nil {
+		return out, ErrYamlToCue(out.Err())
+	}
+	return out, nil
+}
+
+func JsonSchemaToCue(value string) (cue.Value, error) {
+	var out cue.Value
+	jsonSchema, err := json.Extract("", []byte(value))
+	if err != nil {
+		return out, ErrJsonSchemaToCue(err)
+	}
+	cueCtx := cuecontext.New()
+	cueJsonSchemaExpr := cueCtx.BuildExpr(jsonSchema)
+	if err = cueJsonSchemaExpr.Err(); err != nil {
+		return out, ErrJsonSchemaToCue(err)
+	}
+	extractedSchema, err := jsonschema.Extract(cueJsonSchemaExpr, &jsonschema.Config{
+		PkgName: "jsonschemeconv",
+	})
+
+	if err != nil {
+		return out, ErrJsonSchemaToCue(err)
+	}
+	src, err := formatCueNode(extractedSchema)
+	if err != nil {
+		return out, ErrJsonSchemaToCue(err)
+	}
+	out = compileCue(cueCtx, string(src))
+	if out.Err() != nil {
+		return out, ErrJsonSchemaToCue(out.Err())
+	}
+	return out, nil
+}
+
+func Lookup(rootVal cue.Value, path string) (cue.Value, error) {
+	res, err, exists := lookupCuePath(rootVal, path)
+	if err != nil {
+		return res, ErrCueLookup(err)
+	}
+	if !exists {
+		return res, ErrCueLookup(fmt.Errorf("Could not find the value at the path: %s", path))
+	}
+
+	return res.Value(), nil
+}
+
+func ConvertoCue(reader io.Reader) (cue.Value, error) {
+	var result cue.Value
+	cuectx := cuecontext.New()
+	expr, err := yaml.Extract("", reader)
+	if err != nil {
+		return result, ErrYamlToCue(err)
+	}
+	result = cuectx.BuildFile(expr)
+	if result.Err() != nil {
+		return result, ErrYamlToCue(result.Err())
+	}
+	return result, nil
+}
